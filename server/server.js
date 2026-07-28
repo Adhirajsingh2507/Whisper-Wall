@@ -12,31 +12,13 @@ dotenv.config();
 
 // Initialize Express app
 const app = express();
-// Trust the first proxy (Render/Railway/Vercel) so rate-limit sees the real client IP.
+// Trust the first proxy (Vercel/Render) so rate-limit sees the real client IP.
 app.set('trust proxy', 1);
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: (origin, callback) => {
-      const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:3000')
-        .split(',')
-        .map(o => o.trim());
-      // Allow requests with no origin (mobile apps, curl, etc.)
-      if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
-        return callback(null, true);
-      }
-      console.warn(`Socket.IO CORS blocked origin: ${origin}`);
-      return callback(null, false);
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  },
-});
 
 // CORS Configuration - allow cross-origin requests from frontend
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:3000')
   .split(',')
-  .map(o => o.trim());
+  .map((o) => o.trim());
 
 app.use(
   cors({
@@ -53,16 +35,16 @@ app.use(
 // Parse JSON request bodies
 app.use(express.json());
 
-// Attach Socket.IO instance to requests so controllers can emit events
+// Socket.IO instance is only set in local/long-running mode (see bottom).
+// On Vercel serverless it stays null and the controller skips emits;
+// the client's 10s polling fallback covers real-time there.
+let io = null;
 app.use((req, res, next) => {
   req.io = io;
   next();
 });
 
-// API Routes
-app.use('/api/posts', postRoutes);
-
-// Health check endpoint for Render/Railway status monitoring
+// Health check (no DB needed) — register before the DB gate below.
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -71,31 +53,71 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// MongoDB connection using Mongoose with connection pooling
+// Cached Mongoose connection, reused across serverless invocations.
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/whisper-wall';
-mongoose
-  .connect(MONGODB_URI)
-  .then(() => {
-    console.log('Connected to MongoDB');
-  })
-  .catch((err) => {
+let connPromise = null;
+function connectDB() {
+  if (connPromise) return connPromise;
+  connPromise = mongoose
+    .connect(MONGODB_URI)
+    .then((m) => {
+      console.log('Connected to MongoDB');
+      return m;
+    })
+    .catch((err) => {
+      // Reset so the next request retries instead of caching a failed connect.
+      connPromise = null;
+      throw err;
+    });
+  return connPromise;
+}
+
+// Ensure the DB is connected before any /api/posts request (serverless-safe).
+app.use('/api/posts', async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
     console.error('MongoDB connection error:', err.message);
-    process.exit(1);
-  });
-
-// Socket.IO real-time events
-io.on('connection', (socket) => {
-  console.log(`Client connected: ${socket.id}`);
-
-  socket.on('disconnect', () => {
-    console.log(`Client disconnected: ${socket.id}`);
-  });
+    res.status(503).json({ success: false, message: 'Database unavailable' });
+  }
 });
 
-// Start server
-const PORT = process.env.PORT || 5000;
-httpServer.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// API Routes
+app.use('/api/posts', postRoutes);
 
-export { io };
+// Local / long-running mode: real HTTP server + Socket.IO live updates.
+// Skipped on Vercel (serverless), where `app` is exported as the handler.
+if (!process.env.VERCEL) {
+  const httpServer = createServer(app);
+  io = new Server(httpServer, {
+    cors: {
+      origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+          return callback(null, true);
+        }
+        console.warn(`Socket.IO CORS blocked origin: ${origin}`);
+        return callback(null, false);
+      },
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    },
+  });
+
+  io.on('connection', (socket) => {
+    console.log(`Client connected: ${socket.id}`);
+    socket.on('disconnect', () => {
+      console.log(`Client disconnected: ${socket.id}`);
+    });
+  });
+
+  const PORT = process.env.PORT || 5000;
+  connectDB().catch((err) =>
+    console.error('Initial MongoDB connection error:', err.message)
+  );
+  httpServer.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+export default app;
