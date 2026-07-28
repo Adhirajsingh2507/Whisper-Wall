@@ -12,6 +12,8 @@ dotenv.config();
 
 // Initialize Express app
 const app = express();
+// Trust the first proxy (Render/Railway/Vercel) so rate-limit sees the real client IP.
+app.set('trust proxy', 1);
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {

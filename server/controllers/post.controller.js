@@ -20,15 +20,8 @@ export const getPosts = async (req, res) => {
 
 export const createPost = async (req, res) => {
   try {
+    // Already validated by validatePost middleware; schema enforces it too.
     const { message } = req.body;
-
-    // Validation is also enforced at the Mongoose schema level
-    if (!message || message.trim().length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Message cannot be empty',
-      });
-    }
 
     // Security: strip excessive whitespace
     const trimmed = message.trim().replace(/\s+/g, ' ');
